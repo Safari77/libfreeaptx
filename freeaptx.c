@@ -62,10 +62,11 @@ static inline int32_t clip(int32_t a, int32_t amin, int32_t amax)
 
 static inline int32_t sign_extend(int32_t val, unsigned bits)
 {
-    const unsigned shift = 8 * sizeof(val) - bits;
-    union { uint32_t u; int32_t s; } v;
-    v.u = (uint32_t)val << shift;
-    return v.s >> shift;
+    /* Explicitly clear any garbage bits higher than our target bit-width */
+    val &= (1U << bits) - 1;
+
+    uint32_t mask = 1U << (bits - 1);
+    return (int32_t)((val ^ mask) - mask);
 }
 
 enum channels {
@@ -957,16 +958,18 @@ static int aptx_check_parity(const struct aptx_channel channels[NB_CHANNELS], ui
 static void aptx_insert_sync(struct aptx_channel channels[NB_CHANNELS], uint8_t *sync_idx)
 {
     unsigned i;
-    struct aptx_channel *c;
+    int ch;
     static const unsigned map[] = { 1, 2, 0, 3 };
     struct aptx_quantize *min = &channels[NB_CHANNELS-1].quantize[map[0]];
 
     if (aptx_check_parity(channels, sync_idx)) {
-        for (c = &channels[NB_CHANNELS-1]; c >= channels; c--)
-            for (i = 0; i < NB_SUBBANDS; i++)
+        for (ch = NB_CHANNELS - 1; ch >= 0; ch--) {
+            struct aptx_channel *c = &channels[ch];
+            for (i = 0; i < NB_SUBBANDS; i++) {
                 if (c->quantize[map[i]].error < min->error)
                     min = &c->quantize[map[i]];
-
+            }
+        }
         /*
          * Forcing the desired parity is done by offsetting by 1 the quantized
          * sample from the subband featuring the smallest quantization error.
@@ -1191,15 +1194,36 @@ size_t aptx_decode(struct aptx_context *ctx, const unsigned char *input, size_t 
     unsigned sample, channel;
     size_t ipos, opos;
 
-    for (ipos = 0, opos = 0; ipos + sample_size <= input_size && (opos + 3*NB_CHANNELS*4 <= output_size || ctx->decode_skip_leading > 0); ipos += sample_size) {
+    for (ipos = 0, opos = 0; ipos + sample_size <= input_size; ipos += sample_size) {
+
+        /* Pre-calculate how many samples will be written to avoid bounds bypass */
+        unsigned start_sample = 0;
+        unsigned samples_to_write = 4;
+
+        if (ctx->decode_skip_leading > 0) {
+            if (ctx->decode_skip_leading > 1) {
+                samples_to_write = 0; /* Fully skipping this block */
+            } else {
+                start_sample = LATENCY_SAMPLES % 4;
+                samples_to_write = 4 - start_sample;
+            }
+        }
+
+        /* Enforce output boundary check strictly */
+        if (opos + samples_to_write * NB_CHANNELS * 3 > output_size) {
+            break;
+        }
+
+        /* Proceed with decoding */
         if (aptx_decode_samples(ctx, input + ipos, samples))
             break;
+
         sample = 0;
         if (ctx->decode_skip_leading > 0) {
             ctx->decode_skip_leading--;
             if (ctx->decode_skip_leading > 0)
                 continue;
-            sample = LATENCY_SAMPLES%4;
+            sample = LATENCY_SAMPLES % 4;
         }
         for (; sample < 4; sample++) {
             for (channel = 0; channel < NB_CHANNELS; channel++, opos += 3) {
@@ -1269,13 +1293,13 @@ size_t aptx_decode_sync(struct aptx_context *ctx, const unsigned char *input, si
 
     /* If all unprocessed data are now available only in input buffer, do not use internal cache */
     if (ctx->decode_sync_buffer_len == sample_size-1 && ipos == sample_size) {
-        ipos = 0;
+        ipos = 1;
         ctx->decode_sync_buffer_len = 0;
     }
 
     /* Main decode loop, decode as much as possible samples, if decoding fails restart it on next byte */
     while (ipos + sample_size <= input_size && (opos + 3*NB_CHANNELS*4 <= output_size || ctx->decode_skip_leading > 0 || ctx->decode_dropped > 0)) {
-        input_size_step = (((output_size - opos) / 3*NB_CHANNELS*4) + ctx->decode_skip_leading) * sample_size;
+        input_size_step = (((output_size - opos) / (3 * NB_CHANNELS * 4)) + ctx->decode_skip_leading) * sample_size;
         if (input_size_step > ((input_size - ipos) / sample_size) * sample_size)
             input_size_step = ((input_size - ipos) / sample_size) * sample_size;
         if (input_size_step > ((LATENCY_SAMPLES+3)/4 - ctx->decode_sync_packets) * sample_size && ctx->decode_dropped > 0)
